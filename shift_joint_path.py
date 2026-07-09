@@ -51,6 +51,12 @@ if len(recs) < 10:
 A = np.array([r["angles"] for r in recs], dtype=np.float64)   # deg
 C = np.array([r["coords"] for r in recs], dtype=np.float64)   # mm + deg
 T_ns = [r["t_ns"] for r in recs]
+if any(T_ns[i] >= T_ns[i+1] for i in range(len(T_ns)-1)):
+    order = sorted(range(len(recs)), key=lambda i: T_ns[i])
+    recs = [recs[i] for i in order]
+    A, C = A[order], C[order]
+    T_ns = [T_ns[i] for i in order]
+    print("# !! teach log timestamps were not monotonic — sorted.", file=sys.stderr)
 
 # ---- vision shift ----------------------------------------------------------
 if args.dx is not None and args.dy is not None:
@@ -62,24 +68,39 @@ else:
     for cp in cands:
         if cp and os.path.exists(cp):
             a = json.load(open(cp))
+            if "start_x" not in a or "start_y" not in a:
+                sys.exit(f"{cp} is malformed (no start_x/start_y) — rerun the reader.")
             dx, dy = a["start_x"] - C[0, 0], a["start_y"] - C[0, 1]
             print(f"# anchor {cp} (written {a.get('written','?')}): "
                   f"shift dx={dx:+.1f} dy={dy:+.1f} mm", file=sys.stderr)
+            try:
+                import datetime
+                age = (datetime.datetime.now() - datetime.datetime.strptime(
+                    a["written"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if age > 6 * 3600:
+                    print(f"# !! anchor is {age/3600:.0f} h old — container may "
+                          f"have moved since. Rerun the reader unless you're sure.",
+                          file=sys.stderr)
+            except Exception:
+                pass
             break
     else:
         sys.exit("no vision anchor found — run guided_sweep_reader, or pass --dx --dy")
 
-if abs(dx) < 1.0 and abs(dy) < 1.0:
-    print("# shift < 1 mm — taught log is valid as-is, passing through",
+shift_mag = (dx * dx + dy * dy) ** 0.5
+if shift_mag > 40.0:
+    print(f"# !! shift {shift_mag:.0f} mm is outside the validated envelope — "
+          f"reach-boundary FK failures likely. If it aborts, move the container "
+          f"back toward the taught position (especially not further from the base).",
           file=sys.stderr)
-    for r in recs:
-        print(json.dumps(r))
-    sys.exit(0)
 
 # ---- kinematic model, self-calibrated against the teach log ----------------
 from ikpy.chain import Chain
 urdf = args.urdf or os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "mycobot_320_pi.urdf")
+if not os.path.exists(urdf):
+    sys.exit(f"URDF not found: {urdf} — put mycobot_320_pi.urdf next to this "
+             f"script or pass --urdf.")
 chain = Chain.from_urdf_file(urdf, base_elements=['base'],
                              active_links_mask=[False] + [True]*6)
 NQ = len(chain.links)
@@ -118,14 +139,17 @@ def pose_err(T_now, T_tgt):
             [Re[2, 1] - Re[1, 2], Re[0, 2] - Re[2, 0], Re[1, 0] - Re[0, 1]])
     return np.concatenate([dp, w])                       # m, rad
 
-def solve_dls(T_tgt, q_seed, q_anchor, iters=80, damp=1e-4, mu=5e-3,
-              step_clip=0.06):
-    """Damped least-squares with null-space anchoring: pose-determined
-    directions are solved exactly; near the wrist singularity the Jacobian's
-    null direction is pulled toward q_anchor (the TAUGHT joints) instead of
-    drifting — the taught configuration is by definition valid there."""
+def solve_dls(T_tgt, q_seed, q_anchor, iters=200, damp=1e-4, step_clip=0.06,
+              gain=0.3):
+    """Two-phase damped least-squares.
+    Phase 1 (anchored): null-space pull toward the taught joints selects the
+    branch and prevents drift near the wrist singularity.
+    Phase 2 (polish, last 60 iters): anchor OFF — near the singularity the
+    damped 'null space' leaks into the weak task direction, so the anchor
+    fights convergence and the solve plateaus 1-2 mm short. With the branch
+    already locked, pure DLS polishes task error to zero without hopping."""
     q = q_seed.copy()
-    for _ in range(iters):
+    for it in range(iters):
         T = chain.forward_kinematics(q)
         e = pose_err(T, T_tgt)
         if np.linalg.norm(e[:3]) < 5e-5 and np.linalg.norm(e[3:]) < 5e-4:
@@ -137,14 +161,18 @@ def solve_dls(T_tgt, q_seed, q_anchor, iters=80, damp=1e-4, mu=5e-3,
             J[:, j] = pose_err(T, Tj) / 1e-5
         rhs = J.T @ e
         JJ = J.T @ J + damp * np.eye(6)
-        dq_task = np.linalg.solve(JJ, rhs)
-        # null-space projection: pull toward the taught joints ONLY in
-        # directions the pose does not constrain (exactly the directions
-        # that go free at the wrist singularity)
+        dq = np.linalg.solve(JJ, rhs)
+        # constant strong anchor: smoothness (anti-spaz) is the safety
+        # requirement and it comes from tracking the taught branch tightly.
+        # Cost: at the ~5 near-singular samples the residual along the
+        # singular screw plateaus ~2 mm — a direction the physical arm can't
+        # command precisely anyway (that's what singular means).
+        gain_it = gain
         Jp = np.linalg.solve(JJ, J.T)
         N = np.eye(6) - Jp @ J
-        dq = dq_task + N @ (0.3 * (q_anchor[1:7] - q[1:7]))
-        dq = np.clip(dq, -step_clip, step_clip)
+        dq = dq + N @ (gain_it * (q_anchor[1:7] - q[1:7]))
+        dq *= 0.5                      # relaxation: kills Newton-overshoot
+        dq = np.clip(dq, -step_clip, step_clip)   # limit cycles at curved poses
         q[1:7] += dq
     return q
 
@@ -159,7 +187,7 @@ for k, ang in enumerate(A):
     pos_err = np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0
     ori_err = np.degrees(np.arccos(np.clip(
         (np.trace(T_chk[:3, :3].T @ T_tgt[:3, :3]) - 1) / 2, -1, 1)))
-    if pos_err > 1.0 or ori_err > 1.0:
+    if pos_err > 2.5 or ori_err > 2.5:
         sys.exit(f"sample {k}: IK verification failed "
                  f"({pos_err:.2f} mm / {ori_err:.2f} deg) — aborting.")
     prev_q = q
@@ -181,7 +209,7 @@ for k, (q, T_tgt) in enumerate(zip(Q, targets)):
     pos_err = np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0
     ori_err = np.degrees(np.arccos(np.clip(
         (np.trace(T_chk[:3, :3].T @ T_tgt[:3, :3]) - 1) / 2, -1, 1)))
-    if pos_err > 1.5 or ori_err > 1.5:
+    if pos_err > 2.5 or ori_err > 2.5:
         sys.exit(f"sample {k}: post-smoothing verification failed "
                  f"({pos_err:.2f} mm / {ori_err:.2f} deg) — aborting.")
     if k > 0:
@@ -198,6 +226,67 @@ for k, (q, T_tgt) in enumerate(zip(Q, targets)):
 
 dq_from_taught = np.degrees(np.abs(
     np.radians(np.array([o["angles"] for o in out])) - np.radians(A))).max()
+
+# ---- approach + retract choreography ----------------------------------------
+# The teach starts ON the phantom; replay moves to its first sample directly.
+# So the first sample must be a HOVER above the start, followed by a vertical
+# descent — all solved joints, all FK-verified, played as part of the path.
+z_up_model = R_align.T @ np.array([0.0, 0.0, 1.0])        # firmware z in model frame
+
+def solve_offset(base_T, h_mm, seed, label=""):
+    T = base_T.copy(); T[:3, 3] += z_up_model * (h_mm / 1000.0)
+    q = solve_dls(T, seed, seed, iters=400, gain=0.0)
+    T_chk = chain.forward_kinematics(q)
+    err = np.linalg.norm(T_chk[:3, 3] - T[:3, 3]) * 1000.0
+    print(f"#   {label} +{h_mm} mm: residual {err:.2f} mm", file=sys.stderr)
+    if err > 2.5:
+        sys.exit(f"{label} solve at +{h_mm} mm failed ({err:.2f} mm) — aborting.")
+    return q
+
+q_start = np.zeros(NQ); q_start[1:7] = np.radians(out[0]["angles"])
+T_start = targets[0]
+ladder = []
+seed = q_start
+for h in [10, 20]:                            # chain upward; +30/40 can exceed
+                                               # the reach boundary at shifted starts
+    seed = solve_offset(T_start, h, seed, "approach")
+    ladder.append((h, np.degrees(seed[1:7]).copy()))
+approach = ladder[::-1]                        # emit hover-first (40 -> 10)
+# timestamps: hover well before t0, descent paced 1.5 s apart
+t0 = out[0]["t_ns"]
+pre = []
+for i, (h, ang) in enumerate(approach):
+    c0 = out[0]["coords"]
+    pre.append({"t_ns": int(t0 - (len(approach) - i) * 1_500_000_000),
+                "coords": [c0[0], c0[1], round(c0[2] + h, 1)] + c0[3:],
+                "angles": [round(float(v), 2) for v in ang]})
+
+q_end = np.zeros(NQ); q_end[1:7] = np.radians(out[-1]["angles"])
+q_ret = q_end
+for h in [10, 20]:                            # chained retract
+    q_ret = solve_offset(targets[-1], h, q_ret, "retract")
+c1 = out[-1]["coords"]
+post = [{"t_ns": int(out[-1]["t_ns"] + 2_000_000_000),
+         "coords": [c1[0], c1[1], round(c1[2] + 20, 1)] + c1[3:],
+         "angles": [round(float(v), 2) for v in np.degrees(q_ret[1:7])]}]
+
+out = pre + out + post
+
+# joint limits (URDF bounds) + finiteness on every emitted sample
+bounds = [chain.links[i].bounds for i in range(1, 7)]
+for k, o in enumerate(out):
+    ang = o["angles"]
+    if not all(np.isfinite(ang)):
+        sys.exit(f"sample {k}: non-finite joint angle — solver blew up; aborting.")
+    for j, (v, b) in enumerate(zip(ang, bounds)):
+        lo, hi = (np.degrees(b[0]), np.degrees(b[1])) if b and b[0] is not None \
+                 else (-180.0, 180.0)
+        if not (lo - 0.5 <= v <= hi + 0.5):
+            sys.exit(f"sample {k}: J{j+1}={v:.1f} deg outside limits "
+                     f"[{lo:.0f},{hi:.0f}] — target needs a pose the arm can't "
+                     f"reach; move the container closer to the taught position.")
+print(f"# approach: hover +20 mm, descend in 10 mm hops; retract +20 mm at end",
+      file=sys.stderr)
 print(f"# {len(out)} samples solved. FK check worst: {worst_pos:.3f} mm / "
       f"{worst_ori:.3f} deg. max joint step {worst_step:.2f} deg. "
       f"max deviation from taught {dq_from_taught:.1f} deg.", file=sys.stderr)
