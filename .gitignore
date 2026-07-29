@@ -1,0 +1,11 @@
+# ---- ultrasound-cobot: pose logs (runtime data, not source) ----
+# pose_logger.py writes pose_logs/pose_log_<timestamp>.jsonl by default,
+# or a custom name (e.g. pose_logger.jsonl) when given an outfile arg.
+pose_logs/
+pose_log_*.jsonl
+pose_logger.jsonl
+replay_*.jsonl
+
+# python bytecode
+__pycache__/
+*.py[cod]

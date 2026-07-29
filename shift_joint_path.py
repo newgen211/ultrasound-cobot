@@ -41,6 +41,11 @@ ap.add_argument("--dy", type=float, default=None, help="override shift y (mm)")
 ap.add_argument("--max-align-rms", type=float, default=1.5)
 ap.add_argument("--max-step-deg", type=float, default=3.0,
                 help="max joint change between consecutive samples (hop guard)")
+ap.add_argument("--start-lift", type=float, default=0.0,
+                help="mm to lift the START of the sweep, tapering to 0 — for "
+                "when touchdown presses harder than the rest of the path")
+ap.add_argument("--start-taper-mm", type=float, default=30.0,
+                help="travel distance over which the start lift fades out")
 args = ap.parse_args()
 
 # ---- taught path -----------------------------------------------------------
@@ -123,6 +128,18 @@ if rms > args.max_align_rms:
              f"trustworthy for this log; aborting before anything moves.")
 
 dp_model = R_align.T @ np.array([dx, dy, 0.0]) / 1000.0   # shift, model frame
+z_up_m = R_align.T @ np.array([0.0, 0.0, 1.0])            # firmware z in model frame
+
+# tapered start-lift: eases touchdown pressure without touching the rest
+travel = np.concatenate([[0.0], np.cumsum(
+    np.linalg.norm(np.diff(C[:, :2], axis=0), axis=1))])
+def lift_mm(k):
+    if args.start_lift <= 0:
+        return 0.0
+    return args.start_lift * max(0.0, 1.0 - travel[k] / max(args.start_taper_mm, 1e-6))
+if args.start_lift > 0:
+    print(f"# start-lift: +{args.start_lift} mm at touchdown, tapering to 0 "
+          f"over {args.start_taper_mm} mm of travel", file=sys.stderr)
 
 # ---- seed-local damped-least-squares IK -------------------------------------
 # ikpy's global optimizer basin-hops near the wrist singularity (J5~0) — the
@@ -180,7 +197,7 @@ solved_q, targets = [], []
 prev_q = None
 for k, ang in enumerate(A):
     q_taught = np.zeros(NQ); q_taught[1:7] = np.radians(ang)
-    T_tgt = fk_T(ang); T_tgt[:3, 3] += dp_model
+    T_tgt = fk_T(ang); T_tgt[:3, 3] += dp_model + z_up_m * (lift_mm(k) / 1000.0)
     seed = prev_q if prev_q is not None else q_taught
     q = solve_dls(T_tgt, seed, q_taught)
     T_chk = chain.forward_kinematics(q)
@@ -221,7 +238,7 @@ for k, (q, T_tgt) in enumerate(zip(Q, targets)):
     worst_pos, worst_ori = max(worst_pos, pos_err), max(worst_ori, ori_err)
     ang_out = [round(float(v), 2) for v in np.degrees(q[1:7])]
     coords_out = [round(float(C[k, 0] + dx), 1), round(float(C[k, 1] + dy), 1),
-                  round(float(C[k, 2]), 1)] + [float(v) for v in C[k, 3:]]
+                  round(float(C[k, 2] + lift_mm(k)), 1)] + [float(v) for v in C[k, 3:]]
     out.append({"t_ns": T_ns[k], "coords": coords_out, "angles": ang_out})
 
 dq_from_taught = np.degrees(np.abs(
@@ -231,15 +248,18 @@ dq_from_taught = np.degrees(np.abs(
 # The teach starts ON the phantom; replay moves to its first sample directly.
 # So the first sample must be a HOVER above the start, followed by a vertical
 # descent — all solved joints, all FK-verified, played as part of the path.
-z_up_model = R_align.T @ np.array([0.0, 0.0, 1.0])        # firmware z in model frame
 
-def solve_offset(base_T, h_mm, seed, label=""):
-    T = base_T.copy(); T[:3, 3] += z_up_model * (h_mm / 1000.0)
+def solve_offset(base_T, h_mm, seed, label="", optional=False):
+    T = base_T.copy(); T[:3, 3] += z_up_m * (h_mm / 1000.0)
     q = solve_dls(T, seed, seed, iters=400, gain=0.0)
     T_chk = chain.forward_kinematics(q)
     err = np.linalg.norm(T_chk[:3, 3] - T[:3, 3]) * 1000.0
     print(f"#   {label} +{h_mm} mm: residual {err:.2f} mm", file=sys.stderr)
     if err > 2.5:
+        if optional:
+            print(f"#   {label} +{h_mm} mm unreachable — capping ladder here "
+                  f"(reach boundary at this container position)", file=sys.stderr)
+            return None
         sys.exit(f"{label} solve at +{h_mm} mm failed ({err:.2f} mm) — aborting.")
     return q
 
@@ -247,11 +267,14 @@ q_start = np.zeros(NQ); q_start[1:7] = np.radians(out[0]["angles"])
 T_start = targets[0]
 ladder = []
 seed = q_start
-for h in [10, 20]:                            # chain upward; +30/40 can exceed
-                                               # the reach boundary at shifted starts
-    seed = solve_offset(T_start, h, seed, "approach")
+for h in [10, 20, 30, 35]:               # climb as high as reachable; +30 commanded
+    nxt = solve_offset(T_start, h, seed,  # ~= +23 physical after gravity droop
+                       "approach", optional=(h > 20))
+    if nxt is None:
+        break
+    seed = nxt
     ladder.append((h, np.degrees(seed[1:7]).copy()))
-approach = ladder[::-1]                        # emit hover-first (40 -> 10)
+approach = ladder[::-1]                        # emit hover-first
 # timestamps: hover well before t0, descent paced 1.5 s apart
 t0 = out[0]["t_ns"]
 pre = []
@@ -263,11 +286,15 @@ for i, (h, ang) in enumerate(approach):
 
 q_end = np.zeros(NQ); q_end[1:7] = np.radians(out[-1]["angles"])
 q_ret = q_end
-for h in [10, 20]:                            # chained retract
-    q_ret = solve_offset(targets[-1], h, q_ret, "retract")
+ret_h = 0
+for h in [10, 20, 30, 35]:                        # adaptive retract too
+    nxt = solve_offset(targets[-1], h, q_ret, "retract", optional=(h > 20))
+    if nxt is None:
+        break
+    q_ret, ret_h = nxt, h
 c1 = out[-1]["coords"]
 post = [{"t_ns": int(out[-1]["t_ns"] + 2_000_000_000),
-         "coords": [c1[0], c1[1], round(c1[2] + 20, 1)] + c1[3:],
+         "coords": [c1[0], c1[1], round(c1[2] + ret_h, 1)] + c1[3:],
          "angles": [round(float(v), 2) for v in np.degrees(q_ret[1:7])]}]
 
 out = pre + out + post
@@ -285,7 +312,7 @@ for k, o in enumerate(out):
             sys.exit(f"sample {k}: J{j+1}={v:.1f} deg outside limits "
                      f"[{lo:.0f},{hi:.0f}] — target needs a pose the arm can't "
                      f"reach; move the container closer to the taught position.")
-print(f"# approach: hover +20 mm, descend in 10 mm hops; retract +20 mm at end",
+print(f"# approach: hover +{approach[0][0]} mm, descend in hops; retract +{ret_h} mm at end",
       file=sys.stderr)
 print(f"# {len(out)} samples solved. FK check worst: {worst_pos:.3f} mm / "
       f"{worst_ori:.3f} deg. max joint step {worst_step:.2f} deg. "
