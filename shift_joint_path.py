@@ -41,6 +41,8 @@ ap.add_argument("--dy", type=float, default=None, help="override shift y (mm)")
 ap.add_argument("--max-align-rms", type=float, default=1.5)
 ap.add_argument("--max-step-deg", type=float, default=3.0,
                 help="max joint change between consecutive samples (hop guard)")
+ap.add_argument("--fk-gate", type=float, default=2.5,
+                help="FK verification gate in mm/deg (default 2.5; relax knowingly)")
 ap.add_argument("--start-lift", type=float, default=0.0,
                 help="mm to lift the START of the sweep, tapering to 0 — for "
                 "when touchdown presses harder than the rest of the path")
@@ -51,6 +53,7 @@ args = ap.parse_args()
 # ---- taught path -----------------------------------------------------------
 recs = [json.loads(l) for l in open(args.log) if l.strip()]
 recs = [r for r in recs if r.get("angles") and r.get("coords")]
+clean = np.array([not r.get("edited") for r in recs])   # edited coords can't vote on the model
 if len(recs) < 10:
     sys.exit("log too short / missing angles")
 A = np.array([r["angles"] for r in recs], dtype=np.float64)   # deg
@@ -114,14 +117,14 @@ def fk_T(deg6):
     q = np.zeros(NQ); q[1:7] = np.radians(deg6)
     return chain.forward_kinematics(q)
 
-Pm = np.array([fk_T(a)[:3, 3] * 1000.0 for a in A])       # model, mm
-Pf = C[:, :3]                                             # firmware, mm
+Pm = np.array([fk_T(a)[:3, 3] * 1000.0 for a in A])[clean]   # model, mm (untouched pairs only)
+Pf = C[:, :3][clean]                                          # firmware, mm
 cm, cf = Pm.mean(0), Pf.mean(0)
 U, S, Vt = np.linalg.svd((Pm - cm).T @ (Pf - cf))
 d = np.sign(np.linalg.det(Vt.T @ U.T))
 R_align = Vt.T @ np.diag([1, 1, d]) @ U.T                 # model -> firmware
 rms = np.sqrt((((R_align @ (Pm - cm).T).T + cf - Pf) ** 2).sum(1).mean())
-print(f"# model<->firmware alignment RMS: {rms:.2f} mm "
+print(f"# model<->firmware alignment RMS: {rms:.2f} mm ({clean.sum()}/{len(clean)} clean pairs) "
       f"({len(recs)} samples)", file=sys.stderr)
 if rms > args.max_align_rms:
     sys.exit(f"alignment RMS {rms:.2f} > {args.max_align_rms} mm — model not "
@@ -204,7 +207,7 @@ for k, ang in enumerate(A):
     pos_err = np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0
     ori_err = np.degrees(np.arccos(np.clip(
         (np.trace(T_chk[:3, :3].T @ T_tgt[:3, :3]) - 1) / 2, -1, 1)))
-    if pos_err > 2.5 or ori_err > 2.5:
+    if pos_err > args.fk_gate or ori_err > args.fk_gate:
         sys.exit(f"sample {k}: IK verification failed "
                  f"({pos_err:.2f} mm / {ori_err:.2f} deg) — aborting.")
     prev_q = q
@@ -226,7 +229,7 @@ for k, (q, T_tgt) in enumerate(zip(Q, targets)):
     pos_err = np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0
     ori_err = np.degrees(np.arccos(np.clip(
         (np.trace(T_chk[:3, :3].T @ T_tgt[:3, :3]) - 1) / 2, -1, 1)))
-    if pos_err > 2.5 or ori_err > 2.5:
+    if pos_err > args.fk_gate or ori_err > args.fk_gate:
         sys.exit(f"sample {k}: post-smoothing verification failed "
                  f"({pos_err:.2f} mm / {ori_err:.2f} deg) — aborting.")
     if k > 0:
@@ -255,7 +258,7 @@ def solve_offset(base_T, h_mm, seed, label="", optional=False):
     T_chk = chain.forward_kinematics(q)
     err = np.linalg.norm(T_chk[:3, 3] - T[:3, 3]) * 1000.0
     print(f"#   {label} +{h_mm} mm: residual {err:.2f} mm", file=sys.stderr)
-    if err > 2.5:
+    if err > args.fk_gate:
         if optional:
             print(f"#   {label} +{h_mm} mm unreachable — capping ladder here "
                   f"(reach boundary at this container position)", file=sys.stderr)
