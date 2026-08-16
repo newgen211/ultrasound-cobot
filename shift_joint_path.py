@@ -117,8 +117,9 @@ def fk_T(deg6):
     q = np.zeros(NQ); q[1:7] = np.radians(deg6)
     return chain.forward_kinematics(q)
 
-Pm = np.array([fk_T(a)[:3, 3] * 1000.0 for a in A])[clean]   # model, mm (untouched pairs only)
-Pf = C[:, :3][clean]                                          # firmware, mm
+Pm = np.array([fk_T(a)[:3, 3] * 1000.0 for a in A])          # model, mm
+Craw = np.array([r.get("coords_raw", r["coords"]) for r in recs], dtype=np.float64)
+Pf = Craw[:, :3]                                              # firmware truth (pre-edit)
 cm, cf = Pm.mean(0), Pf.mean(0)
 U, S, Vt = np.linalg.svd((Pm - cm).T @ (Pf - cf))
 d = np.sign(np.linalg.det(Vt.T @ U.T))
@@ -201,15 +202,26 @@ prev_q = None
 for k, ang in enumerate(A):
     q_taught = np.zeros(NQ); q_taught[1:7] = np.radians(ang)
     T_tgt = fk_T(ang); T_tgt[:3, 3] += dp_model + z_up_m * (lift_mm(k) / 1000.0)
+    d_fw = (C[k, :3] - Craw[k, :3]) / 1000.0            # post-processing edits, firmware frame
+    if np.any(d_fw):
+        T_tgt[:3, 3] += R_align.T @ d_fw                # honor edited coords in the flown path
     seed = prev_q if prev_q is not None else q_taught
     q = solve_dls(T_tgt, seed, q_taught)
+    for _retry in range(3):                     # convergence top-up for strained samples
+        T_chk = chain.forward_kinematics(q)
+        if np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0 <= args.fk_gate:
+            break
+        q = solve_dls(T_tgt, q, q)              # refine anchor-free: branch already chosen by pass 1
     T_chk = chain.forward_kinematics(q)
     pos_err = np.linalg.norm(T_chk[:3, 3] - T_tgt[:3, 3]) * 1000.0
     ori_err = np.degrees(np.arccos(np.clip(
         (np.trace(T_chk[:3, :3].T @ T_tgt[:3, :3]) - 1) / 2, -1, 1)))
-    if pos_err > args.fk_gate or ori_err > args.fk_gate:
-        sys.exit(f"sample {k}: IK verification failed "
+    if pos_err > 2 * args.fk_gate or ori_err > 2 * args.fk_gate:
+        sys.exit(f"sample {k}: IK verification failed badly "
                  f"({pos_err:.2f} mm / {ori_err:.2f} deg) — aborting.")
+    if pos_err > args.fk_gate or ori_err > args.fk_gate:
+        print(f"# sample {k}: pre-smoothing residual {pos_err:.2f} mm — "
+              f"deferring to the post-smoothing gate", file=sys.stderr)
     prev_q = q
     solved_q.append(q.copy())
     targets.append(T_tgt)
