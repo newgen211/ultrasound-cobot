@@ -9,3 +9,10 @@ replay_*.jsonl
 # python bytecode
 __pycache__/
 *.py[cod]
+
+# lift-table era
+lift_table.log
+pose_logs/replay_*.jsonl
+pose_logs/supervised_*.jsonl
+nohup.out
+sweep*.log
