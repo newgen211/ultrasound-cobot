@@ -26,4 +26,5 @@ probe.env
 libcast.so
 libcast.dylib
 pyclariuscast.so
+sdk_lib/
 clarius_sessions/

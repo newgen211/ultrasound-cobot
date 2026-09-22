@@ -6,6 +6,9 @@ set -euo pipefail
 LAUNCH=$1; SEC=$2; SPEED=${3:-25}; RATE=${4:-2}; DELAY=${5:-8}
 cd ~/Documents/ultrasound-cobot
 source probe.env
+# The Cast 12.2.0 aarch64 build wants GLIBCXX_3.4.30 (GCC 12); focal ships GCC 9. A focal-built
+# libstdc++ from ubuntu-toolchain-r sits in sdk_lib/ so nothing system-wide changes.
+export LD_LIBRARY_PATH=$PWD/sdk_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 [ -s "$LAUNCH" ] || { echo "ABORT: no launch file $LAUNCH"; exit 1; }
 SESS=clarius_sessions/section_$SEC
 [ -e "$SESS" ] && { echo "ABORT: $SESS exists"; exit 1; }
