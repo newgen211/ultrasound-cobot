@@ -146,6 +146,9 @@ def main():
                     "N seconds then play — for when starting the capture "
                     "requires switching the Mac onto the Clarius WiFi (which "
                     "kills the SSH session). 45 is comfortable.")
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="never wait for Enter: connect at once and home without asking "
+                    "(for flight.sh, which runs this without a terminal)")
     args = ap.parse_args()
 
     home_angles = [float(x) for x in args.home.split(",")]
@@ -181,7 +184,8 @@ def main():
         return
 
     print("\n⚠️  The arm will MOVE on its own. Clear the workspace.")
-    input("    Press Enter to connect and begin... ")
+    if not args.no_prompt:
+        input("    Press Enter to connect and begin... ")
 
     mc = MyCobot320(PORT, BAUD)
     lock = threading.Lock()
@@ -258,12 +262,15 @@ def main():
 
     if not args.no_home:
         print(f"\n↩  Return to home {home_angles} — large move, slow.")
-        try:
-            input("    Clear of the arm? Press Enter to home... ")
-        except EOFError:
-            print("    (stdin gone — SSH dropped. Skipping home; arm holds at "
-                  "retract. Reattach tmux and home manually when back online.)")
-        else:
+        go = True
+        if not args.no_prompt:
+            try:
+                input("    Clear of the arm? Press Enter to home... ")
+            except EOFError:
+                print("    (stdin gone — SSH dropped. Skipping home; arm holds at "
+                      "retract. Reattach tmux and home manually when back online.)")
+                go = False
+        if go:
             with lock:
                 mc.send_angles(home_angles, args.home_speed)
             wait_until_stopped(mc, lock)

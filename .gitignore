@@ -20,3 +20,10 @@ __pycache__/
 lift_table.log
 nohup.out
 sweep*.log
+
+# one-button flight: local probe settings, the Cast SDK binaries, and capture output
+probe.env
+libcast.so
+libcast.dylib
+pyclariuscast.so
+clarius_sessions/
