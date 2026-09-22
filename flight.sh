@@ -16,7 +16,7 @@ ping -c1 -W2 "$PROBE_IP" >/dev/null || { echo "ABORT: probe unreachable"; exit 1
 ip -4 addr show wlan0 | grep inet
 echo "== capture"
 mkdir -p clarius_sessions
-python3 cast_headless.py --section "$SEC" --ip "$PROBE_IP" --port "$PROBE_PORT" > "$SESS.capture.log" 2>&1 &
+python3.10 cast_headless.py --section "$SEC" --ip "$PROBE_IP" --port "$PROBE_PORT" > "$SESS.capture.log" 2>&1 &
 CAP=$!
 sleep 6
 n=$(ls "$SESS"/raw_*.bin 2>/dev/null | wc -l)
