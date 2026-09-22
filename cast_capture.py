@@ -79,6 +79,13 @@ class Store:
 
 store = Store()
 
+# pyclariuscast keeps the callbacks it is given without taking a reference to
+# them, so anything that goes out of scope is collected and the SDK's own thread
+# then calls freed objects: a segfault with no Python frame, during connect.
+# The closures below are built per caster, so they are pinned here for the life
+# of the process.
+_CALLBACK_KEEPALIVE = []
+
 
 def make_caster(on_image=None, on_freeze=None, on_button=None):
     """Build the pyclariuscast.Caster with the shared callbacks wired in.
@@ -108,9 +115,11 @@ def make_caster(on_image=None, on_freeze=None, on_button=None):
     def spectrum(*_):
         return
 
-    return pyclariuscast.Caster(processed, raw, spectrum, imu_only,
-                                on_freeze or (lambda *_: None),
-                                on_button or (lambda *_: None))
+    callbacks = (processed, raw, spectrum, imu_only,
+                 on_freeze or (lambda *_: None),
+                 on_button or (lambda *_: None))
+    _CALLBACK_KEEPALIVE.append(callbacks)
+    return pyclariuscast.Caster(*callbacks)
 
 
 class Session:
