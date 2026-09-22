@@ -1,9 +1,10 @@
 # ---- ultrasound-cobot: pose logs ----
-# Runtime data (regenerable) — ignored.
+# Runtime data (regenerable) is ignored.
 #   pose_logger.py writes pose_logs/pose_log_<timestamp>.jsonl by default.
 pose_logs/exec_*
 pose_logs/pose_log_*.jsonl
 pose_logs/replay_*.jsonl
+pose_logs/supervised_*.jsonl
 pose_logger.jsonl
 
 # Work products (irreplaceable) are intentionally NOT ignored and stay tracked:
@@ -14,3 +15,8 @@ pose_logger.jsonl
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# lift-table era
+lift_table.log
+nohup.out
+sweep*.log
