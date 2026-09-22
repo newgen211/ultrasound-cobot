@@ -24,7 +24,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("log", help="pose_logger jsonl of the taught sweep")
 ap.add_argument("--anchor", default=None,
                 help="vision_anchor.json from the reader (default: "
-                "src/calibration/vision_anchor.json, then ./vision_anchor.json)")
+                "../calib/vision_anchor.json, then ./vision_anchor.json)")
 ap.add_argument("--start-x", type=float, default=None,
                 help="override: vision waypoint-0 x")
 ap.add_argument("--start-y", type=float, default=None,
@@ -49,8 +49,8 @@ args = ap.parse_args()
 if args.start_x is None or args.start_y is None:
     import os
     candidates = ([args.anchor] if args.anchor else
-                  ["src/calibration/vision_anchor.json", "vision_anchor.json",
-                   "../src/calibration/vision_anchor.json"])
+                  ["../calib/vision_anchor.json", "calib/vision_anchor.json",
+                   "vision_anchor.json"])
     for cpath in candidates:
         if cpath and os.path.exists(cpath):
             a = json.load(open(cpath))

@@ -71,8 +71,8 @@ if args.dx is not None and args.dy is not None:
     dx, dy = args.dx, args.dy
 else:
     cands = ([args.anchor] if args.anchor else
-             ["src/calibration/vision_anchor.json", "vision_anchor.json",
-              "../src/calibration/vision_anchor.json"])
+             ["../calib/vision_anchor.json", "calib/vision_anchor.json",
+              "vision_anchor.json"])
     for cp in cands:
         if cp and os.path.exists(cp):
             a = json.load(open(cp))
